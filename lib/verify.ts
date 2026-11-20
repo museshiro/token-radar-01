@@ -1,11 +1,11 @@
-// Board audit (radar-2): a second, independent pass over the ranked board before anything is
+// Board audit (radar-3): a second, independent pass over the ranked board before anything is
 // written to /output. It does not score or rank; it only asks whether the finished board is
 // the board the gate expects, and it prints a short human-readable report so a bad build is
 // visible in the build log instead of surfacing later as a rejected submission. The checks
 // mirror the competition gate, not the model: ranks, order, coverage, farm plans, and the
 // shape of every row. Nothing here changes the board; it only reads it.
 
-import type { BoardRow } from './model.ts';
+import type { BoardRow, Verdict } from './model.ts';
 
 /** One thing the audit noticed, with a short machine-readable code and a human sentence. */
 export interface AuditFinding {
@@ -27,6 +27,8 @@ export interface AuditReport {
   duplicateSlugs: string[];
   biggestCategories: { category: string; rows: number }[];
   largestTvls: { slug: string; tvlUsd: number }[];
+  verdicts: { farm: number; marginal: number; skip: number };
+  boardTotalUsd: number;
 }
 
 const MAX_IMPLIED_USD = 100_000_000_000_000;
@@ -113,6 +115,24 @@ export function auditBoard(board: BoardRow[], watchlist: string[]): AuditReport 
   }
 
   const impliedValues = board.map((row) => row.implied_value_usd);
+  const verdicts = { farm: 0, marginal: 0, skip: 0 };
+  for (const row of board) {
+    const v: Verdict = row.verdict;
+    if (v !== 'farm' && v !== 'marginal' && v !== 'skip') {
+      findings.push(finding('error', 'verdict-missing', `${row.slug} has no farm / marginal / skip verdict`));
+    } else {
+      verdicts[v]++;
+    }
+    if (!(row.launch_odds >= 0 && row.launch_odds <= 1)) {
+      findings.push(finding('error', 'launch-odds-range', `${row.slug} has launch odds ${row.launch_odds}, outside 0 to 1`));
+    }
+    if (!(row.range_lo_usd > 0 && row.range_hi_usd >= row.range_lo_usd)) {
+      findings.push(finding('error', 'range-shape', `${row.slug} has a P25-P75 range $${row.range_lo_usd} to $${row.range_hi_usd}`));
+    }
+    if (!(row.farm_net_usd <= row.farm_value_usd)) {
+      findings.push(finding('error', 'farm-net-shape', `${row.slug} has farm net $${row.farm_net_usd} above its farm value $${row.farm_value_usd}`));
+    }
+  }
   return {
     rows: board.length,
     findings,
@@ -125,6 +145,8 @@ export function auditBoard(board: BoardRow[], watchlist: string[]): AuditReport 
     duplicateSlugs,
     biggestCategories: biggestCategoriesOf(board),
     largestTvls: largestTvlsOf(board),
+    verdicts,
+    boardTotalUsd: impliedValues.reduce((s, v) => s + v, 0),
   };
 }
 
@@ -138,6 +160,7 @@ export function formatAudit(report: AuditReport): string {
     `token radar audit: ${report.rows} rows, watchlist ${report.watchlistCovered}/${report.watchlistTotal}, top implied $${report.topImpliedUsd.toLocaleString('en-US')}, median implied $${report.medianImpliedUsd.toLocaleString('en-US')}`,
     `token radar audit: ${report.distinctChains} chains, ${report.distinctCategories} categories, ${report.duplicateSlugs.length} duplicate slugs, ${errors} errors, ${warnings} warnings`,
     `token radar audit: biggest categories: ${categoryText}; largest TVLs: ${tvlText}`,
+    `token radar audit: board total $${report.boardTotalUsd.toLocaleString('en-US')}; verdicts farm ${report.verdicts.farm}, marginal ${report.verdicts.marginal}, skip ${report.verdicts.skip}`,
   ];
   for (const f of report.findings) lines.push(`token radar audit: [${f.severity}] ${f.code}: ${f.detail}`);
   return lines.join('\n');

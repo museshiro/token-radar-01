@@ -1,4 +1,4 @@
-// The token radar's model: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and may add
 // pre-token protocols below the watchlist floor: the early rows the radar exists to find. A protocol is
@@ -6,17 +6,32 @@
 // snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
 // the ranked board.
 //
-// Implied value follows only from the snapshot's own figures:
+// Implied value follows only from the snapshot's own figures, and the curve is fitted to them, not
+// asserted: the traded tokens that are clean comparables give a log-log line of market cap against
+// TVL, and a protocol's implied value is read off that line, adjusted for its own growth, age and
+// chain count, then priced below the median comp on purpose (see lib/validate.ts for the fit):
 //
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   chainsMult = 1 + min(chains - 1, 5) x CHAINS_WEIGHT  (reach: how many chains carry the TVL)
-//   implied    = max(1, round(base x growthMult x maturity x chainsMult))
+//   comps curve  log(mcap / multipliers) = curve_intercept + curve_slope x log(tvl_usd)
+//   growth       = clamp(change_7d, -60, 120) per cent
+//   growthMult   = 1 + (growth / 100) x GROWTH_WEIGHT
+//   maturity     = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
+//   chainsMult   = 1 + min(chains - 1, 5) x CHAINS_WEIGHT  (reach: how many chains carry the TVL)
+//   implied      = max(1, round(exp(curve_intercept + curve_slope x log(tvl_usd))
+//                      x growthMult x maturity x chainsMult x calibration))
 //
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+// The curve is concave (slope under 1): a market cap grows slower than the TVL behind it, so the
+// largest protocols are compressed and the tail is lifted, which is what the traded tokens show.
+// The calibration prices at the 40th percentile of the comps, so 60% of comparable traded tokens
+// exceed the level the radar claims: a pre-token protocol has not yet proven a token market.
+//
+// Every row also carries a verdict and the numbers behind it. The farm value is the reader's
+// expected share of the airdrop pool: the implied value times the drop share, times the launch
+// odds, split among the farmers the TVL implies (TVL divided by the average deposit). The farm
+// cost is the gas for a month of farming, about $16 ($8 to set up, $2 a week); the hour of time
+// the plan takes is stated beside it, not priced, because the reader's time is their own. Farm
+// when the net clears $50, marginal when it clears $0, skip when it does not. The launch odds
+// come from a logistic model fitted to the snapshot (see lib/validate.ts). No protocol name is
+// ever special-cased: the same functions score every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -41,9 +56,13 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The model's constants, as the dashboard states them and the sandbox may change them. */
+/** The model's constants, as the dashboard states them and the sandbox may change them. The curve
+ *  constants are the fitted values from lib/validate.ts; main.ts refits them from the snapshot on
+ *  every run, so the numbers here are the fit's own output, not a second source. */
 export interface ModelConstants {
-  base_multiple: number;
+  curve_intercept: number;
+  curve_slope: number;
+  calibration: number;
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -53,10 +72,16 @@ export interface ModelConstants {
   unknown_age_days: number;
   chains_weight: number;
   chains_cap: number;
+  drop_share: number;
+  avg_deposit_usd: number;
+  farm_cost_usd: number;
+  farm_threshold_usd: number;
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
+  curve_intercept: 8.9717,
+  curve_slope: 0.4115,
+  calibration: 0.68,
   growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
@@ -66,10 +91,14 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   chains_weight: 0.03,
   chains_cap: 5,
+  drop_share: 0.07,
+  avg_deposit_usd: 5000,
+  farm_cost_usd: 16,
+  farm_threshold_usd: 50,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -77,12 +106,58 @@ export const EARLY_ROWS = 160;
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
+/** The validation numbers the dashboard prints, all leave-one-out from the snapshot (lib/validate.ts). */
+export interface Validation {
+  comps: number;
+  loo_miss: number;
+  newer_half_miss: number;
+  newer_half_n: number;
+  p25_factor: number;
+  p75_factor: number;
+  p10_factor: number;
+  p90_factor: number;
+  coverage_2575: number;
+  coverage_2575_n: number;
+  coverage_1090: number;
+  coverage_1090_n: number;
+  launch_accuracy: number;
+  launch_correct: number;
+  launch_total: number;
+  launch_traded: number;
+  launch_pretoken: number;
+}
+
+/** The launch model the dashboard scores with: a logistic regression's weights and the
+ *  standardisation it was fitted on (lib/validate.ts). */
+export interface LaunchModel {
+  weights: number[];
+  mean: number[];
+  sd: number[];
+}
+
+/** One reason a protocol is set aside from the ranked board, and how many it accounts for. */
+export interface SetAsideReason {
+  reason: string;
+  count: number;
+  examples: string[];
+}
+
+/** The whole snapshot, accounted for: the ranked rows plus every protocol set aside, by reason. */
+export interface SetAside {
+  total: number;
+  ranked: number;
+  reasons: SetAsideReason[];
+}
+
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
   text: string;
   cost: string;
   time: string;
 }
+
+/** Whether the farm economics say to farm a row, farm it thinly, or skip it. */
+export type Verdict = 'farm' | 'marginal' | 'skip';
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -101,13 +176,21 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    base_multiple: number;
+    curve_intercept: number;
+    curve_slope: number;
+    calibration: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
     chains_multiplier: number;
     age_days: number | null;
   };
+  launch_odds: number;
+  verdict: Verdict;
+  farm_value_usd: number;
+  farm_net_usd: number;
+  range_lo_usd: number;
+  range_hi_usd: number;
   farm_steps: string[];
 }
 
@@ -128,6 +211,12 @@ export interface RadarRow {
   maturity_multiplier: number;
   chains_multiplier: number;
   watchlist: boolean;
+  launch_odds: number;
+  verdict: Verdict;
+  farm_value_usd: number;
+  farm_net_usd: number;
+  range_lo_usd: number;
+  range_hi_usd: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -141,7 +230,7 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** Everything the dashboard needs: the board, the live set, and the model it runs. */
+/** Everything the dashboard needs: the board, the live set, the validation, and the model it runs. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -152,6 +241,8 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  validation: Validation;
+  set_aside: SetAside;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -189,9 +280,35 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainsMult = 1 + Math.min(Math.max(protocol.chains.length - 1, 0), model.chains_cap) * model.chains_weight;
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainsMult));
+  const curve = Math.exp(model.curve_intercept + model.curve_slope * Math.log(Math.max(1, protocol.tvl_usd)));
+  const implied = Math.max(1, Math.round(curve * growthMult * maturityMult * chainsMult * model.calibration));
   return { implied, growthPct, growthMult, maturityMult, chainsMult, age };
+}
+
+/** The launch model's four features, in the order its weights expect them. */
+export function launchFeatures(p: SnapshotProtocol, asOf: string): number[] {
+  const age = ageDays(asOf, p.listed_at) ?? 365;
+  return [Math.log10(Math.max(1, p.tvl_usd)), Math.min(120, Math.max(-60, finite(p.change_7d, 0))), Math.log10(age + 1), p.chains.length];
+}
+
+/** One protocol's launch odds under a fitted launch model, 0 to 1. */
+export function launchOdds(p: SnapshotProtocol, asOf: string, launch: LaunchModel): number {
+  const raw = launchFeatures(p, asOf);
+  let s = launch.weights[0]!;
+  for (let j = 0; j < raw.length; j++) s += launch.weights[j + 1]! * ((raw[j]! - launch.mean[j]!) / launch.sd[j]!);
+  return 1 / (1 + Math.exp(-s));
+}
+
+/** The farm economics of one row: the reader's expected share of the airdrop pool, the cost of a
+ *  month of farming, and the verdict that follows. The pool is the implied value times the drop
+ *  share, times the launch odds, split among the farmers the TVL implies at the average deposit.
+ *  The cost is gas only; the hour of time the plan takes is stated beside the verdict, not priced. */
+export function verdictFor(implied: number, odds: number, tvl: number, model: ModelConstants): { verdict: Verdict; farmValue: number; farmNet: number; farmers: number } {
+  const farmers = Math.max(1, Math.round(tvl / model.avg_deposit_usd));
+  const farmValue = (implied * model.drop_share * odds * model.avg_deposit_usd) / Math.max(1, tvl);
+  const farmNet = farmValue - model.farm_cost_usd;
+  const verdict: Verdict = farmNet >= model.farm_threshold_usd ? 'farm' : farmNet >= 0 ? 'marginal' : 'skip';
+  return { verdict, farmValue, farmNet, farmers };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -220,8 +337,54 @@ export interface BoardSummary {
   live_size: number;
 }
 
+/** Why a protocol is set aside from the ranked board, in the order the reasons are checked. */
+export function setAsideReason(p: SnapshotProtocol): string {
+  if (p.mcap_usd !== null && p.mcap_usd > 0) return 'already has a token that trades';
+  if (p.category === 'CEX') return 'an exchange, not a protocol to farm';
+  if (VERSIONED.test(p.name)) return 'a versioned pool of another protocol';
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('bridge') || c.includes('liquid staking') || c.includes('liquid restaking') || c.includes('restaked btc')) {
+    return 'a bridge, wrapped or staked product';
+  }
+  if (p.name.toLowerCase().includes('wrapped') || p.name.toLowerCase().includes('staked') || p.name.toLowerCase().includes('staking')) {
+    return 'a bridge, wrapped or staked product';
+  }
+  if (p.gecko_id !== null || p.symbol !== null) return 'records a token but no market cap';
+  return 'below the floor, outside the early radar';
+}
+
+/** Every protocol in the snapshot, accounted for: the ranked rows plus the set-aside, by reason. */
+export function setAsideBreakdown(snapshot: Snapshot, rankedSlugs: Set<string>): SetAside {
+  const reasons = new Map<string, string[]>();
+  for (const p of snapshot.protocols) {
+    if (rankedSlugs.has(p.slug)) continue;
+    const reason = setAsideReason(p);
+    const list = reasons.get(reason) ?? [];
+    list.push(p.slug);
+    reasons.set(reason, list);
+  }
+  const order = [
+    'already has a token that trades',
+    'records a token but no market cap',
+    'a bridge, wrapped or staked product',
+    'an exchange, not a protocol to farm',
+    'a versioned pool of another protocol',
+    'below the floor, outside the early radar',
+  ];
+  const out: SetAsideReason[] = [];
+  for (const reason of order) {
+    const slugs = reasons.get(reason) ?? [];
+    if (slugs.length > 0) out.push({ reason, count: slugs.length, examples: slugs.slice(0, 3) });
+    reasons.delete(reason);
+  }
+  for (const [reason, slugs] of reasons) {
+    if (slugs.length > 0) out.push({ reason, count: slugs.length, examples: slugs.slice(0, 3) });
+  }
+  return { total: snapshot.protocols.length, ranked: rankedSlugs.size, reasons: out };
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants, validation: Validation, launch: LaunchModel): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -240,7 +403,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const { implied, growthPct, growthMult, maturityMult, chainsMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, chainsMult, age };
+    const odds = launchOdds(p, snapshot.as_of, launch);
+    const econ = verdictFor(implied, odds, p.tvl_usd, model);
+    return { p, implied, growthPct, growthMult, maturityMult, chainsMult, age, odds, econ };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -259,13 +424,21 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      base_multiple: model.base_multiple,
+      curve_intercept: model.curve_intercept,
+      curve_slope: model.curve_slope,
+      calibration: model.calibration,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       chains_multiplier: round4(s.chainsMult),
       age_days: s.age,
     },
+    launch_odds: Math.round(s.odds * 1000) / 1000,
+    verdict: s.econ.verdict,
+    farm_value_usd: Math.round(s.econ.farmValue * 100) / 100,
+    farm_net_usd: Math.round(s.econ.farmNet * 100) / 100,
+    range_lo_usd: Math.max(1, Math.round(s.implied * validation.p25_factor)),
+    range_hi_usd: Math.max(1, Math.round(s.implied * validation.p75_factor)),
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
 }
@@ -424,14 +597,21 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     chains_multiplier: row.model.chains_multiplier,
     watchlist,
+    launch_odds: row.launch_odds,
+    verdict: row.verdict,
+    farm_value_usd: row.farm_value_usd,
+    farm_net_usd: row.farm_net_usd,
+    range_lo_usd: row.range_lo_usd,
+    range_hi_usd: row.range_hi_usd,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+export function buildRadar(snapshot: Snapshot, model: ModelConstants, validation: Validation, launch: LaunchModel): { board: BoardRow[]; radar: RadarData } {
+  const board = buildBoard(snapshot, model, validation, launch);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const setAside = setAsideBreakdown(snapshot, new Set(board.map((r) => r.slug)));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -442,6 +622,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    validation,
+    set_aside: setAside,
     rows: board.map((r) => radarRow(r, snapshot.watchlist.includes(r.slug))),
     live,
   };

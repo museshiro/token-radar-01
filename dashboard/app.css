@@ -236,3 +236,16 @@ tbody tr[data-focused="true"] {
   position: absolute; width: 1px; height: 1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
 }
+
+.kpis { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--step-4); }
+.kpi { display: grid; gap: 2px; align-content: start; }
+.kpi b { font-family: var(--font-num); font-size: 20px; font-weight: 600; }
+.kpi span:first-child { color: var(--muted); font-size: 12px; }
+.verdict-farm, .verdict-marginal, .verdict-skip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.verdict-farm { background: var(--accent); color: var(--surface); }
+.verdict-marginal { border: 1px solid var(--accent); color: var(--accent); }
+.verdict-skip { border: 1px solid var(--border); color: var(--muted); }
+.set-aside { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.reasons { margin: 0; padding-left: var(--step-5); display: grid; gap: var(--step-2); font-size: 14px; }
+.reasons b { font-family: var(--font-num); font-weight: 600; }

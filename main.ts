@@ -1,13 +1,15 @@
-// Token Radar radar-2 (Node 22, standard library only). The program reads the sealed snapshot from
-// /input/snapshot.json (or --input <file|dir>), scores every pre-token protocol with the model in
-// lib/model.ts, writes the ranked board to /output/board.json, and copies this repository's dashboard/
-// and screenshots/ to /output. Last, it writes /output/dossier.json, the summary the judge reads,
-// with the vendored make.fun library.
+// Token Radar radar-3 (Node 22, standard library only). The program reads the sealed snapshot from
+// /input/snapshot.json (or --input <file|dir>), calibrates the model against the snapshot's traded
+// tokens and fits the launch odds (lib/validate.ts), scores every pre-token protocol with the model
+// in lib/model.ts, writes the ranked board to /output/board.json, and copies this repository's
+// dashboard/ and screenshots/ to /output. Last, it writes /output/dossier.json, the summary the
+// judge reads, with the vendored make.fun library.
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board. radar-2 adds
-// a chains-reach multiplier to the model, category-specific weekly farm steps with a second-chain step,
-// a chain filter and watchlist toggle, and a model sandbox that re-ranks the page live.
+// and dashboard/app.js read /output/data.js, which this program writes from the same board. radar-3
+// replaces the asserted TVL multiple with a comps curve fitted to the traded tokens, prices below the
+// median comp, prints the leave-one-out validation on the board, gives every row a farm / marginal /
+// skip verdict from its farm economics, and accounts for all 758 protocols.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -15,8 +17,9 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, MODEL, parseSnapshot, type ModelConstants } from './lib/model.ts';
 import { auditBoard, formatAudit } from './lib/verify.ts';
+import { fitCalibration, fitLaunchOdds } from './lib/validate.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -43,13 +46,48 @@ if (!existsSync(inputFile)) {
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar } = buildRadar(snapshot);
+// Calibrate first, from the snapshot alone: the comps curve and its leave-one-out validation, then
+// the launch odds. The fitted curve becomes the model's constants, so the board and the page run
+// the numbers the snapshot itself produced.
+const calibration = fitCalibration(snapshot, MODEL);
+const launch = fitLaunchOdds(snapshot);
+const model: ModelConstants = {
+  ...MODEL,
+  curve_intercept: calibration.intercept,
+  curve_slope: calibration.slope,
+  calibration: calibration.factor,
+};
+const validation = {
+  comps: calibration.comps,
+  loo_miss: calibration.looMiss,
+  newer_half_miss: calibration.newerHalfMiss,
+  newer_half_n: calibration.newerHalfN,
+  p25_factor: calibration.p25Factor,
+  p75_factor: calibration.p75Factor,
+  p10_factor: calibration.p10Factor,
+  p90_factor: calibration.p90Factor,
+  coverage_2575: calibration.coverage2575,
+  coverage_2575_n: calibration.coverage2575N,
+  coverage_1090: calibration.coverage1090,
+  coverage_1090_n: calibration.coverage1090N,
+  launch_accuracy: launch.accuracy,
+  launch_correct: launch.correct,
+  launch_total: launch.total,
+  launch_traded: launch.traded,
+  launch_pretoken: launch.preToken,
+};
+const launchModel = { weights: launch.weights, mean: launch.mean, sd: launch.sd };
+const { board, radar } = buildRadar(snapshot, model, validation, launchModel);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
   process.exit(1);
 }
 process.stdout.write(`${formatAudit(auditBoard(board, snapshot.watchlist))}\n`);
+process.stdout.write(
+  `token radar: calibration from ${calibration.comps} comps: curve log(mcap/mult) = ${calibration.intercept.toFixed(4)} + ${calibration.slope.toFixed(4)} x log(TVL), factor ${calibration.factor.toFixed(3)} (40th percentile)\n` +
+    `token radar: validation leave-one-out: typical miss x${calibration.looMiss.toFixed(2)}, newer half x${calibration.newerHalfMiss.toFixed(2)} (n=${calibration.newerHalfN}), P25-P75 holds ${(100 * calibration.coverage2575).toFixed(0)}% (${calibration.coverage2575N}/${calibration.comps}), P10-P90 holds ${(100 * calibration.coverage1090).toFixed(0)}% (${calibration.coverage1090N}/${calibration.comps}), launch odds ${(100 * launch.accuracy).toFixed(1)}% (${launch.correct}/${launch.total})\n`,
+);
 
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
